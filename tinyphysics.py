@@ -78,7 +78,6 @@ class TinyPhysicsModel:
   def predict(self, input_data: dict, temperature=1.) -> int:
     res = self.ort_session.run(None, input_data)[0]
     probs = self.softmax(res / temperature, axis=-1)
-    # we only care about the last timestep (batch size is just 1)
     assert probs.shape[0] == 1
     assert probs.shape[2] == VOCAB_SIZE
     sample = np.random.choice(probs.shape[2], p=probs[0, -1])
@@ -112,6 +111,7 @@ class TinyPhysicsSimulator:
     self.current_lataccel_history = [x[1] for x in state_target_futureplans]
     self.target_lataccel_history = [x[1] for x in state_target_futureplans]
     self.target_future = None
+    self.futureplan = None
     self.current_lataccel = self.current_lataccel_history[-1]
     seed = int(md5(self.data_path.encode()).hexdigest(), 16) % 10**4
     np.random.seed(seed)
@@ -123,7 +123,7 @@ class TinyPhysicsSimulator:
       'v_ego': df['vEgo'].values,
       'a_ego': df['aEgo'].values,
       'target_lataccel': df['targetLateralAcceleration'].values,
-      'steer_command': -df['steerCommand'].values  # steer commands are logged with left-positive convention but this simulator uses right-positive
+      'steer_command': -df['steerCommand'].values
     })
     return processed_df
 
@@ -149,15 +149,20 @@ class TinyPhysicsSimulator:
     self.action_history.append(action)
 
   def get_state_target_futureplan(self, step_idx: int) -> Tuple[State, float, FuturePlan]:
+    if step_idx >= len(self.data):
+      step_idx = len(self.data)-1
     state = self.data.iloc[step_idx]
+    future_end = step_idx + FUTURE_PLAN_STEPS
+    if future_end > len(self.data):
+      future_end = len(self.data)
     return (
       State(roll_lataccel=state['roll_lataccel'], v_ego=state['v_ego'], a_ego=state['a_ego']),
       state['target_lataccel'],
       FuturePlan(
-        lataccel=self.data['target_lataccel'].values[step_idx + 1:step_idx + FUTURE_PLAN_STEPS].tolist(),
-        roll_lataccel=self.data['roll_lataccel'].values[step_idx + 1:step_idx + FUTURE_PLAN_STEPS].tolist(),
-        v_ego=self.data['v_ego'].values[step_idx + 1:step_idx + FUTURE_PLAN_STEPS].tolist(),
-        a_ego=self.data['a_ego'].values[step_idx + 1:step_idx + FUTURE_PLAN_STEPS].tolist()
+        lataccel=self.data['target_lataccel'].values[step_idx + 1:future_end].tolist(),
+        roll_lataccel=self.data['roll_lataccel'].values[step_idx + 1:future_end].tolist(),
+        v_ego=self.data['v_ego'].values[step_idx + 1:future_end].tolist(),
+        a_ego=self.data['a_ego'].values[step_idx + 1:future_end].tolist()
       )
     )
 
@@ -170,16 +175,6 @@ class TinyPhysicsSimulator:
     self.sim_step(self.step_idx)
     self.step_idx += 1
 
-  def plot_data(self, ax, lines, axis_labels, title) -> None:
-    ax.clear()
-    for line, label in lines:
-      ax.plot(line, label=label)
-    ax.axline((CONTROL_START_IDX, 0), (CONTROL_START_IDX, 1), color='black', linestyle='--', alpha=0.5, label='Control Start')
-    ax.legend()
-    ax.set_title(f"{title} | Step: {self.step_idx}")
-    ax.set_xlabel(axis_labels[0])
-    ax.set_ylabel(axis_labels[1])
-
   def compute_cost(self) -> Dict[str, float]:
     target = np.array(self.target_lataccel_history)[CONTROL_START_IDX:COST_END_IDX]
     pred = np.array(self.current_lataccel_history)[CONTROL_START_IDX:COST_END_IDX]
@@ -190,36 +185,64 @@ class TinyPhysicsSimulator:
     return {'lataccel_cost': lat_accel_cost, 'jerk_cost': jerk_cost, 'total_cost': total_cost}
 
   def rollout(self) -> Dict[str, float]:
-    if self.debug:
-      plt.ion()
-      fig, ax = plt.subplots(4, figsize=(12, 14), constrained_layout=True)
+      # Run through the data
+      for _ in range(CONTEXT_LENGTH, len(self.data)):
+          self.step()
 
-    for _ in range(CONTEXT_LENGTH, len(self.data)):
-      self.step()
-      if self.debug and self.step_idx % 10 == 0:
-        print(f"Step {self.step_idx:<5}: Current lataccel: {self.current_lataccel:>6.2f}, Target lataccel: {self.target_lataccel_history[-1]:>6.2f}")
-        self.plot_data(ax[0], [(self.target_lataccel_history, 'Target lataccel'), (self.current_lataccel_history, 'Current lataccel')], ['Step', 'Lateral Acceleration'], 'Lateral Acceleration')
-        self.plot_data(ax[1], [(self.action_history, 'Action')], ['Step', 'Action'], 'Action')
-        self.plot_data(ax[2], [(np.array(self.state_history)[:, 0], 'Roll Lateral Acceleration')], ['Step', 'Lateral Accel due to Road Roll'], 'Lateral Accel due to Road Roll')
-        self.plot_data(ax[3], [(np.array(self.state_history)[:, 1], 'v_ego')], ['Step', 'v_ego'], 'v_ego')
-        plt.pause(0.01)
+      # Now that we've fully simulated all steps, compute the cost
+      return self.compute_cost()
 
-    if self.debug:
-      plt.ioff()
-      plt.show()
-    return self.compute_cost()
+
+  # Methods for RL Integration
+  def apply_action(self, action: float):
+    action = np.clip(action, STEER_RANGE[0], STEER_RANGE[1])
+    self.action_history.append(action)
+    if self.step_idx < len(self.data):
+      state, target, futureplan = self.get_state_target_futureplan(self.step_idx)
+      self.state_history.append(state)
+      self.target_lataccel_history.append(target)
+      self.futureplan = futureplan
+      self.sim_step(self.step_idx)
+      self.step_idx += 1
+
+  def is_done(self):
+    return self.step_idx >= len(self.data)
+
+  def get_observation(self):
+    state = self.state_history[-1]
+    obs = np.array([
+      self.current_lataccel_history[-1],
+      self.target_lataccel_history[-1],
+      state.roll_lataccel,
+      state.v_ego,
+      state.a_ego
+    ], dtype=np.float32)
+    return obs
+
+  def get_reward(self):
+    if len(self.current_lataccel_history) < 2:
+      return 0.0
+    target = self.target_lataccel_history[-1]
+    current = self.current_lataccel_history[-1]
+    prev = self.current_lataccel_history[-2]
+    jerk = (current - prev) / DEL_T
+
+    lat_accel_error = (target - current)**2
+    jerk_cost = (jerk**2)*0.1
+    cost = lat_accel_error + jerk_cost
+    reward = -cost
+    return reward
 
 
 def get_available_controllers():
+  from pathlib import Path
   return [f.stem for f in Path('controllers').iterdir() if f.is_file() and f.suffix == '.py' and f.stem != '__init__']
-
 
 def run_rollout(data_path, controller_type, model_path, debug=False):
   tinyphysicsmodel = TinyPhysicsModel(model_path, debug=debug)
   controller = importlib.import_module(f'controllers.{controller_type}').Controller()
   sim = TinyPhysicsSimulator(tinyphysicsmodel, str(data_path), controller=controller, debug=debug)
   return sim.rollout(), sim.target_lataccel_history, sim.current_lataccel_history
-
 
 def download_dataset():
   print("Downloading dataset (0.6G)...")
@@ -230,36 +253,3 @@ def download_dataset():
         if not member.endswith('/'):
           with z.open(member) as src, open(DATASET_PATH / os.path.basename(member), 'wb') as dest:
             dest.write(src.read())
-
-
-if __name__ == "__main__":
-  available_controllers = get_available_controllers()
-  parser = argparse.ArgumentParser()
-  parser.add_argument("--model_path", type=str, required=True)
-  parser.add_argument("--data_path", type=str, required=True)
-  parser.add_argument("--num_segs", type=int, default=100)
-  parser.add_argument("--debug", action='store_true')
-  parser.add_argument("--controller", default='pid', choices=available_controllers)
-  args = parser.parse_args()
-
-  if not DATASET_PATH.exists():
-    download_dataset()
-
-  data_path = Path(args.data_path)
-  if data_path.is_file():
-    cost, _, _ = run_rollout(data_path, args.controller, args.model_path, debug=args.debug)
-    print(f"\nAverage lataccel_cost: {cost['lataccel_cost']:>6.4}, average jerk_cost: {cost['jerk_cost']:>6.4}, average total_cost: {cost['total_cost']:>6.4}")
-  elif data_path.is_dir():
-    run_rollout_partial = partial(run_rollout, controller_type=args.controller, model_path=args.model_path, debug=False)
-    files = sorted(data_path.iterdir())[:args.num_segs]
-    results = process_map(run_rollout_partial, files, max_workers=16, chunksize=10)
-    costs = [result[0] for result in results]
-    costs_df = pd.DataFrame(costs)
-    print(f"\nAverage lataccel_cost: {np.mean(costs_df['lataccel_cost']):>6.4}, average jerk_cost: {np.mean(costs_df['jerk_cost']):>6.4}, average total_cost: {np.mean(costs_df['total_cost']):>6.4}")
-    for cost in costs_df.columns:
-      plt.hist(costs_df[cost], bins=np.arange(0, 1000, 10), label=cost, alpha=0.5)
-    plt.xlabel('costs')
-    plt.ylabel('Frequency')
-    plt.title('costs Distribution')
-    plt.legend()
-    plt.show()
